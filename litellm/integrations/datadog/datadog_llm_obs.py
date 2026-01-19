@@ -203,28 +203,57 @@ class DataDogLLMObsLogger(CustomBatchLogger):
 
         metadata = kwargs.get("litellm_params", {}).get("metadata", {})
 
-        input_meta = InputMeta(
-            messages=handle_any_messages_to_chat_completion_str_messages_conversion(
-                messages
-            )
-        )
-        output_meta = OutputMeta(
-            messages=self._get_response_messages(
-                standard_logging_payload=standard_logging_payload,
-                call_type=standard_logging_payload.get("call_type"),
-            )
-        )
-
-        error_info = self._assemble_error_info(standard_logging_payload)
-
         metadata_parent_id: Optional[str] = None
         if isinstance(metadata, dict):
             metadata_parent_id = metadata.get("parent_id")
 
+        kind = self._get_datadog_span_kind(
+            standard_logging_payload.get("call_type"), metadata_parent_id
+        )
+
+        if kind == "llm":
+            input_meta = InputMeta(
+                messages=handle_any_messages_to_chat_completion_str_messages_conversion(
+                    messages
+                )
+            )
+            # Extract and attach prompt information if provided
+            prompt_info = self._extract_prompt_from_metadata(metadata)
+            if prompt_info is not None:
+                input_meta["prompt"] = prompt_info
+
+            output_meta = OutputMeta(
+                messages=self._get_response_messages(
+                    standard_logging_payload=standard_logging_payload,
+                    call_type=standard_logging_payload.get("call_type"),
+                )
+            )
+        else:
+            # For non-LLM kinds, use 'value' as per Datadog's API preference
+            # We want a single string for 'value'
+            input_val = ""
+            if messages:
+                first_msg = messages[0]
+                if isinstance(first_msg, str):
+                    input_val = first_msg
+                elif isinstance(first_msg, dict):
+                    input_val = first_msg.get("content", str(first_msg))
+                else:
+                    input_val = str(first_msg)
+
+            input_meta = InputMeta(value=input_val)
+            resp_messages = self._get_response_messages(
+                standard_logging_payload=standard_logging_payload,
+                call_type=standard_logging_payload.get("call_type"),
+            )
+            output_meta = OutputMeta(
+                messages=resp_messages
+            )
+
+        error_info = self._assemble_error_info(standard_logging_payload)
+
         meta = Meta(
-            kind=self._get_datadog_span_kind(
-                standard_logging_payload.get("call_type"), metadata_parent_id
-            ),
+            kind=kind,
             input=input_meta,
             output=output_meta,
             metadata=self._get_dd_llm_obs_payload_metadata(standard_logging_payload),
@@ -791,3 +820,164 @@ class DataDogLLMObsLogger(CustomBatchLogger):
             )
 
         return tool_call_metadata
+
+    # Common patterns that might indicate sensitive data in prompt variables
+    _SENSITIVE_KEY_PATTERNS = (
+        "key", "token", "secret", "password", "credential", "auth",
+        "api_key", "apikey", "access_token", "bearer", "private",
+    )
+
+    def _extract_prompt_from_metadata(
+        self, metadata: Dict[str, Any]
+    ) -> Optional[DDPrompt]:
+        """
+        Extract and validate prompt information from LiteLLM metadata.
+
+        Users can pass prompt information via metadata["dd_prompt"] when making
+        LiteLLM calls. This enables prompt tracking and versioning in Datadog
+        LLM Observability.
+
+        Security considerations:
+            - If turn_off_message_logging is enabled, prompt info is NOT sent
+              to protect potentially sensitive template/variable content.
+            - Variables are checked for sensitive key patterns and warnings
+              are logged if potential sensitive data is detected.
+
+        Example usage:
+            ```python
+            import litellm
+
+            response = litellm.completion(
+                model="gpt-4",
+                messages=[{"role": "user", "content": "Hello, world!"}],
+                metadata={
+                    "dd_prompt": {
+                        "id": "greeting-prompt",
+                        "version": "1.0.0",
+                        "template": "Say hello to {name}",
+                        "variables": {"name": "world"},
+                        "tags": {"team": "ml-platform"},
+                    }
+                }
+            )
+            ```
+
+        Args:
+            metadata: The metadata dict from litellm_params
+
+        Returns:
+            DDPrompt if valid prompt info found, None otherwise
+        """
+        #####################################################################
+        # Security check: If message logging is disabled, skip prompt too
+        # This ensures sensitive template/variable content is not leaked
+        #####################################################################
+        if getattr(self, "turn_off_message_logging", False):
+            verbose_logger.debug(
+                "DataDogLLMObs: Skipping prompt extraction - "
+                "turn_off_message_logging is enabled"
+            )
+            return None
+
+        if not metadata:
+            return None
+
+        dd_prompt_raw = metadata.get("dd_prompt")
+        if dd_prompt_raw is None:
+            return None
+
+        if not isinstance(dd_prompt_raw, dict):
+            verbose_logger.debug(
+                "DataDogLLMObs: dd_prompt must be a dictionary, got %s",
+                type(dd_prompt_raw).__name__,
+            )
+            return None
+
+        try:
+            # Build DDPrompt with validated fields
+            prompt: DDPrompt = DDPrompt()
+
+            # Required fields (at least one of id or template should be present)
+            if "id" in dd_prompt_raw:
+                prompt["id"] = str(dd_prompt_raw["id"])
+
+            if "version" in dd_prompt_raw:
+                prompt["version"] = str(dd_prompt_raw["version"])
+
+            if "template" in dd_prompt_raw:
+                prompt["template"] = str(dd_prompt_raw["template"])
+
+            if "chat_template" in dd_prompt_raw:
+                chat_template = dd_prompt_raw["chat_template"]
+                if isinstance(chat_template, list):
+                    prompt["chat_template"] = chat_template
+
+            if "variables" in dd_prompt_raw:
+                variables = dd_prompt_raw["variables"]
+                if isinstance(variables, dict):
+                    # Security check: Warn about potentially sensitive variable keys
+                    self._warn_if_sensitive_variables(variables)
+                    # Ensure all values are strings
+                    prompt["variables"] = {
+                        str(k): str(v) for k, v in variables.items()
+                    }
+
+            if "tags" in dd_prompt_raw:
+                tags = dd_prompt_raw["tags"]
+                if isinstance(tags, dict):
+                    prompt["tags"] = {str(k): str(v) for k, v in tags.items()}
+
+            if "rag_context_variables" in dd_prompt_raw:
+                rag_ctx = dd_prompt_raw["rag_context_variables"]
+                if isinstance(rag_ctx, list):
+                    prompt["rag_context_variables"] = [str(v) for v in rag_ctx]
+
+            if "rag_query_variables" in dd_prompt_raw:
+                rag_query = dd_prompt_raw["rag_query_variables"]
+                if isinstance(rag_query, list):
+                    prompt["rag_query_variables"] = [str(v) for v in rag_query]
+
+            # Return None if no meaningful fields were set
+            if not prompt:
+                verbose_logger.debug(
+                    "DataDogLLMObs: dd_prompt has no valid fields"
+                )
+                return None
+
+            verbose_logger.debug(
+                "DataDogLLMObs: Extracted prompt info with id=%s, version=%s",
+                prompt.get("id"),
+                prompt.get("version"),
+            )
+            return prompt
+
+        except Exception as e:
+            verbose_logger.debug(
+                f"DataDogLLMObs: Error extracting prompt from metadata: {str(e)}"
+            )
+            return None
+
+    def _warn_if_sensitive_variables(self, variables: Dict[str, Any]) -> None:
+        """
+        Log a warning if any variable keys match patterns that might indicate
+        sensitive data (e.g., api_key, password, token, secret).
+
+        This is a best-effort check to help users avoid accidentally sending
+        sensitive data to Datadog. It does not block the data from being sent.
+        """
+        sensitive_keys_found = []
+        for key in variables.keys():
+            key_lower = str(key).lower()
+            for pattern in self._SENSITIVE_KEY_PATTERNS:
+                if pattern in key_lower:
+                    sensitive_keys_found.append(key)
+                    break
+
+        if sensitive_keys_found:
+            verbose_logger.warning(
+                "DataDogLLMObs: Potential sensitive data detected in dd_prompt.variables. "
+                "Keys matching sensitive patterns: %s. "
+                "Consider using turn_off_message_logging=True or removing sensitive data "
+                "from prompt variables to prevent data leakage.",
+                sensitive_keys_found,
+            )

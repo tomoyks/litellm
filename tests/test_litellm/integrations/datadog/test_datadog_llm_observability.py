@@ -1120,3 +1120,227 @@ async def test_spend_metrics_in_datadog_payload(mock_env_vars):
     now = datetime.now(timezone.utc)
     time_diff = (budget_reset_dt - now).total_seconds() / 86400  # days
     assert 9.5 <= time_diff <= 10.5  # Should be close to 10 days
+
+
+class TestDataDogLLMObsPromptTracking:
+    """Test suite for DataDog LLM Observability Prompt Tracking integration"""
+
+    @pytest.fixture
+    def mock_env_vars(self):
+        """Mock environment variables for DataDog"""
+        with patch.dict(
+            os.environ, {"DD_API_KEY": "test_api_key", "DD_SITE": "us5.datadoghq.com"}
+        ):
+            yield
+
+    def test_prompt_extraction_basic(self, mock_env_vars):
+        """Test that basic prompt info is extracted from metadata"""
+        with patch(
+            "litellm.integrations.datadog.datadog_llm_obs.get_async_httpx_client"
+        ), patch("asyncio.create_task"):
+            logger = DataDogLLMObsLogger()
+
+            metadata = {
+                "dd_prompt": {
+                    "id": "greeting-prompt",
+                    "version": "1.0.0",
+                    "template": "Say hello to {name}",
+                    "variables": {"name": "world"},
+                }
+            }
+
+            prompt = logger._extract_prompt_from_metadata(metadata)
+
+            assert prompt is not None
+            assert prompt["id"] == "greeting-prompt"
+            assert prompt["version"] == "1.0.0"
+            assert prompt["template"] == "Say hello to {name}"
+            assert prompt["variables"] == {"name": "world"}
+
+    def test_prompt_extraction_with_chat_template(self, mock_env_vars):
+        """Test that chat_template is correctly extracted"""
+        with patch(
+            "litellm.integrations.datadog.datadog_llm_obs.get_async_httpx_client"
+        ), patch("asyncio.create_task"):
+            logger = DataDogLLMObsLogger()
+
+            metadata = {
+                "dd_prompt": {
+                    "id": "chat-prompt",
+                    "version": "2.0",
+                    "chat_template": [
+                        {"role": "system", "content": "You are a helpful assistant."},
+                        {"role": "user", "content": "Hello, {name}!"},
+                    ],
+                    "variables": {"name": "Alice"},
+                }
+            }
+
+            prompt = logger._extract_prompt_from_metadata(metadata)
+
+            assert prompt is not None
+            assert prompt["id"] == "chat-prompt"
+            assert prompt["chat_template"] == [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": "Hello, {name}!"},
+            ]
+
+    def test_prompt_extraction_with_rag_variables(self, mock_env_vars):
+        """Test that RAG-related variables are correctly extracted"""
+        with patch(
+            "litellm.integrations.datadog.datadog_llm_obs.get_async_httpx_client"
+        ), patch("asyncio.create_task"):
+            logger = DataDogLLMObsLogger()
+
+            metadata = {
+                "dd_prompt": {
+                    "id": "rag-prompt",
+                    "version": "1.0",
+                    "template": "Context: {context}\nQuestion: {question}",
+                    "variables": {
+                        "context": "Python is a programming language.",
+                        "question": "What is Python?",
+                    },
+                    "rag_context_variables": ["context"],
+                    "rag_query_variables": ["question"],
+                }
+            }
+
+            prompt = logger._extract_prompt_from_metadata(metadata)
+
+            assert prompt is not None
+            assert prompt["rag_context_variables"] == ["context"]
+            assert prompt["rag_query_variables"] == ["question"]
+
+    def test_prompt_extraction_with_tags(self, mock_env_vars):
+        """Test that prompt tags are correctly extracted"""
+        with patch(
+            "litellm.integrations.datadog.datadog_llm_obs.get_async_httpx_client"
+        ), patch("asyncio.create_task"):
+            logger = DataDogLLMObsLogger()
+
+            metadata = {
+                "dd_prompt": {
+                    "id": "tagged-prompt",
+                    "version": "1.0",
+                    "template": "Hello",
+                    "tags": {"team": "ml-platform", "env": "production"},
+                }
+            }
+
+            prompt = logger._extract_prompt_from_metadata(metadata)
+
+            assert prompt is not None
+            assert prompt["tags"] == {"team": "ml-platform", "env": "production"}
+
+    def test_prompt_extraction_no_prompt(self, mock_env_vars):
+        """Test that None is returned when no prompt info is provided"""
+        with patch(
+            "litellm.integrations.datadog.datadog_llm_obs.get_async_httpx_client"
+        ), patch("asyncio.create_task"):
+            logger = DataDogLLMObsLogger()
+
+            # No dd_prompt in metadata
+            metadata = {"some_other_key": "value"}
+            prompt = logger._extract_prompt_from_metadata(metadata)
+            assert prompt is None
+
+            # Empty metadata
+            prompt = logger._extract_prompt_from_metadata({})
+            assert prompt is None
+
+            # None metadata
+            prompt = logger._extract_prompt_from_metadata(None)
+            assert prompt is None
+
+    def test_prompt_extraction_invalid_format(self, mock_env_vars):
+        """Test that invalid prompt formats are handled gracefully"""
+        with patch(
+            "litellm.integrations.datadog.datadog_llm_obs.get_async_httpx_client"
+        ), patch("asyncio.create_task"):
+            logger = DataDogLLMObsLogger()
+
+            # dd_prompt is not a dict
+            metadata = {"dd_prompt": "not a dict"}
+            prompt = logger._extract_prompt_from_metadata(metadata)
+            assert prompt is None
+
+            # dd_prompt is a list
+            metadata = {"dd_prompt": ["item1", "item2"]}
+            prompt = logger._extract_prompt_from_metadata(metadata)
+            assert prompt is None
+
+    def test_prompt_in_payload(self, mock_env_vars):
+        """Test that prompt info is correctly included in the LLM Obs payload"""
+        with patch(
+            "litellm.integrations.datadog.datadog_llm_obs.get_async_httpx_client"
+        ), patch("asyncio.create_task"):
+            logger = DataDogLLMObsLogger()
+
+            standard_payload = create_standard_logging_payload_with_cache()
+
+            kwargs = {
+                "standard_logging_object": standard_payload,
+                "litellm_params": {
+                    "metadata": {
+                        "dd_prompt": {
+                            "id": "test-prompt",
+                            "version": "1.0.0",
+                            "template": "Answer: {question}",
+                            "variables": {"question": "What is 2+2?"},
+                        }
+                    }
+                },
+            }
+
+            start_time = datetime.now()
+            end_time = datetime.now()
+
+            payload = logger.create_llm_obs_payload(kwargs, start_time, end_time)
+
+            # Verify prompt is in input meta
+            meta = payload.get("meta", {})
+            input_meta = meta.get("input", {})
+
+            assert "prompt" in input_meta
+            prompt = input_meta["prompt"]
+            assert prompt["id"] == "test-prompt"
+            assert prompt["version"] == "1.0.0"
+            assert prompt["template"] == "Answer: {question}"
+            assert prompt["variables"] == {"question": "What is 2+2?"}
+
+    def test_prompt_not_added_for_non_llm_spans(self, mock_env_vars):
+        """Test that prompt is not added for non-LLM span kinds (e.g., embedding)"""
+        with patch(
+            "litellm.integrations.datadog.datadog_llm_obs.get_async_httpx_client"
+        ), patch("asyncio.create_task"):
+            logger = DataDogLLMObsLogger()
+
+            # Create a payload for an embedding call
+            standard_payload = create_standard_logging_payload_with_cache()
+            standard_payload["call_type"] = "embedding"
+
+            kwargs = {
+                "standard_logging_object": standard_payload,
+                "litellm_params": {
+                    "metadata": {
+                        "dd_prompt": {
+                            "id": "test-prompt",
+                            "version": "1.0.0",
+                        }
+                    }
+                },
+            }
+
+            start_time = datetime.now()
+            end_time = datetime.now()
+
+            payload = logger.create_llm_obs_payload(kwargs, start_time, end_time)
+
+            # For non-LLM spans, we use 'value' not 'messages', so prompt should not be added
+            meta = payload.get("meta", {})
+            input_meta = meta.get("input", {})
+
+            # Embedding spans use 'value' format, so no messages and no prompt
+            assert "messages" not in input_meta or input_meta.get("messages") is None
+            assert "prompt" not in input_meta
