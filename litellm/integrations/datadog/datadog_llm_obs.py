@@ -246,9 +246,7 @@ class DataDogLLMObsLogger(CustomBatchLogger):
                 standard_logging_payload=standard_logging_payload,
                 call_type=standard_logging_payload.get("call_type"),
             )
-            output_meta = OutputMeta(
-                messages=resp_messages
-            )
+            output_meta = OutputMeta(messages=resp_messages)
 
         error_info = self._assemble_error_info(standard_logging_payload)
 
@@ -823,8 +821,17 @@ class DataDogLLMObsLogger(CustomBatchLogger):
 
     # Common patterns that might indicate sensitive data in prompt variables
     _SENSITIVE_KEY_PATTERNS = (
-        "key", "token", "secret", "password", "credential", "auth",
-        "api_key", "apikey", "access_token", "bearer", "private",
+        "key",
+        "token",
+        "secret",
+        "password",
+        "credential",
+        "auth",
+        "api_key",
+        "apikey",
+        "access_token",
+        "bearer",
+        "private",
     )
 
     def _extract_prompt_from_metadata(
@@ -918,9 +925,7 @@ class DataDogLLMObsLogger(CustomBatchLogger):
                     # Security check: Warn about potentially sensitive variable keys
                     self._warn_if_sensitive_variables(variables)
                     # Ensure all values are strings
-                    prompt["variables"] = {
-                        str(k): str(v) for k, v in variables.items()
-                    }
+                    prompt["variables"] = {str(k): str(v) for k, v in variables.items()}
 
             if "tags" in dd_prompt_raw:
                 tags = dd_prompt_raw["tags"]
@@ -939,9 +944,7 @@ class DataDogLLMObsLogger(CustomBatchLogger):
 
             # Return None if no meaningful fields were set
             if not prompt:
-                verbose_logger.debug(
-                    "DataDogLLMObs: dd_prompt has no valid fields"
-                )
+                verbose_logger.debug("DataDogLLMObs: dd_prompt has no valid fields")
                 return None
 
             verbose_logger.debug(
