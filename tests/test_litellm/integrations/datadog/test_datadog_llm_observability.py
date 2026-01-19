@@ -394,52 +394,61 @@ async def test_dd_llms_obs_redaction(mock_env_vars):
     litellm._turn_on_debug()
     from litellm.types.utils import LiteLLMCommonStrings
 
-    litellm.datadog_llm_observability_params = DatadogLLMObsInitParams(
-        turn_off_message_logging=True
-    )
-    dd_llms_obs_logger = TestDataDogLLMObsLoggerForRedaction()
-    test_s3_logger = TestS3Logger()
-    litellm.callbacks = [dd_llms_obs_logger, test_s3_logger]
+    # Store original values for cleanup
+    original_params = litellm.datadog_llm_observability_params
+    original_callbacks = litellm.callbacks
 
-    # call litellm
-    await litellm.acompletion(
-        model="gpt-4o",
-        mock_response="Hi there!",
-        messages=[{"role": "user", "content": "Hello, world!"}],
-    )
+    try:
+        litellm.datadog_llm_observability_params = DatadogLLMObsInitParams(
+            turn_off_message_logging=True
+        )
+        dd_llms_obs_logger = TestDataDogLLMObsLoggerForRedaction()
+        test_s3_logger = TestS3Logger()
+        litellm.callbacks = [dd_llms_obs_logger, test_s3_logger]
 
-    # sleep 1 second for logging to complete
-    await asyncio.sleep(1)
+        # call litellm
+        await litellm.acompletion(
+            model="gpt-4o",
+            mock_response="Hi there!",
+            messages=[{"role": "user", "content": "Hello, world!"}],
+        )
 
-    #################
-    # test validation
-    # 1. both loggers logged a standard_logging_payload
-    # 2. DD LLM Obs standard_logging_payload has messages and response redacted
-    # 3. S3 standard_logging_payload does not have messages and response redacted
+        # sleep 1 second for logging to complete
+        await asyncio.sleep(1)
 
-    assert dd_llms_obs_logger.logged_standard_logging_payload is not None
-    assert test_s3_logger.logged_standard_logging_payload is not None
+        #################
+        # test validation
+        # 1. both loggers logged a standard_logging_payload
+        # 2. DD LLM Obs standard_logging_payload has messages and response redacted
+        # 3. S3 standard_logging_payload does not have messages and response redacted
 
-    assert (
-        dd_llms_obs_logger.logged_standard_logging_payload["messages"][0]["content"]
-        == "redacted-by-litellm"
-    )
-    assert (
-        dd_llms_obs_logger.logged_standard_logging_payload["response"]["choices"][0][
-            "message"
-        ]["content"]
-        == "redacted-by-litellm"
-    )
+        assert dd_llms_obs_logger.logged_standard_logging_payload is not None
+        assert test_s3_logger.logged_standard_logging_payload is not None
 
-    assert test_s3_logger.logged_standard_logging_payload["messages"] == [
-        {"role": "user", "content": "Hello, world!"}
-    ]
-    assert (
-        test_s3_logger.logged_standard_logging_payload["response"]["choices"][0][
-            "message"
-        ]["content"]
-        == "Hi there!"
-    )
+        assert (
+            dd_llms_obs_logger.logged_standard_logging_payload["messages"][0]["content"]
+            == "redacted-by-litellm"
+        )
+        assert (
+            dd_llms_obs_logger.logged_standard_logging_payload["response"]["choices"][0][
+                "message"
+            ]["content"]
+            == "redacted-by-litellm"
+        )
+
+        assert test_s3_logger.logged_standard_logging_payload["messages"] == [
+            {"role": "user", "content": "Hello, world!"}
+        ]
+        assert (
+            test_s3_logger.logged_standard_logging_payload["response"]["choices"][0][
+                "message"
+            ]["content"]
+            == "Hi there!"
+        )
+    finally:
+        # Cleanup: restore original values to avoid polluting other tests
+        litellm.datadog_llm_observability_params = original_params
+        litellm.callbacks = original_callbacks
 
 
 @pytest.fixture
@@ -1324,6 +1333,9 @@ class TestDataDogLLMObsPromptTracking:
                 "standard_logging_object": standard_payload,
                 "litellm_params": {
                     "metadata": {
+                        # parent_id is required for non-LLM span kinds to be recognized
+                        # (root spans default to "llm" kind for Datadog compatibility)
+                        "parent_id": "parent-span-123",
                         "dd_prompt": {
                             "id": "test-prompt",
                             "version": "1.0.0",
